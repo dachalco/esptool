@@ -2296,11 +2296,11 @@ class BaseFirmwareImage(object):
             if offset > 0x40200000 or offset < 0x3ffe0000 or size > 65536:
                 print('WARNING: Suspicious segment 0x%x, length %d' % (offset, size))
 
-    def maybe_patch_segment_data(self, f, segment_data):
+    def maybe_patch_segment_data(self, f, segment_data, mcuboot=False):
         """If SHA256 digest of the ELF file needs to be inserted into this segment, do so. Returns segment data."""
         segment_len = len(segment_data)
         file_pos = f.tell()  # file_pos is position in the .bin file
-        if self.elf_sha256_offset >= file_pos and self.elf_sha256_offset < file_pos + segment_len:
+        if not mcuboot and self.elf_sha256_offset >= file_pos and self.elf_sha256_offset < file_pos + segment_len:
             # SHA256 digest needs to be patched into this binary segment,
             # calculate offset of the digest inside the binary segment.
             patch_offset = self.elf_sha256_offset - file_pos
@@ -2319,9 +2319,9 @@ class BaseFirmwareImage(object):
                 segment_data[patch_offset + self.SHA256_DIGEST_LEN:]
         return segment_data
 
-    def save_segment(self, f, segment, checksum=None):
+    def save_segment(self, f, segment, checksum=None, mcuboot=False):
         """ Save the next segment to the image file, return next checksum value if provided """
-        segment_data = self.maybe_patch_segment_data(f, segment.data)
+        segment_data = self.maybe_patch_segment_data(f, segment.data, mcuboot)
         f.write(struct.pack('<II', segment.addr, len(segment_data)))
         f.write(segment_data)
         if checksum is not None:
@@ -2623,15 +2623,17 @@ class ESP32FirmwareImage(BaseFirmwareImage):
     def warn_if_unusual_segment(self, offset, size, is_irom_segment):
         pass  # TODO: add warnings for ESP32 segment offset/size combinations that are wrong
 
-    def save(self, filename):
+    def save(self, filename, mcuboot=False):
         total_segments = 0
         with io.BytesIO() as f:  # write file to memory first
-            self.write_common_header(f, self.segments)
+            if not mcuboot:
+                self.write_common_header(f, self.segments)
 
-            # first 4 bytes of header are read by ROM bootloader for SPI
-            # config, but currently unused
-            self.save_extended_header(f)
+                # first 4 bytes of header are read by ROM bootloader for SPI
+                # config, but currently unused
+                self.save_extended_header(f)
 
+            
             checksum = ESPLoader.ESP_CHECKSUM_MAGIC
 
             # split segments into flash-mapped vs ram-loaded, and take copies so we can mutate them
@@ -2657,6 +2659,8 @@ class ESP32FirmwareImage(BaseFirmwareImage):
                 # (this is because the segment's vaddr may not be IROM_ALIGNed, more likely is aligned
                 # IROM_ALIGN+0x18 to account for the binary file header
                 align_past = (segment.addr % self.IROM_ALIGN) - self.SEG_HEADER_LEN
+                current_address = f.tell()
+                pad_len = (self.IROM_ALIGN - (current_address % self.IROM_ALIGN)) + align_past
                 pad_len = (self.IROM_ALIGN - (f.tell() % self.IROM_ALIGN)) + align_past
                 if pad_len == 0 or pad_len == self.IROM_ALIGN:
                     return 0  # already aligned
@@ -2679,7 +2683,7 @@ class ESP32FirmwareImage(BaseFirmwareImage):
                             ram_segments.pop(0)
                     else:
                         pad_segment = ImageSegment(0, b'\x00' * pad_len, f.tell())
-                    checksum = self.save_segment(f, pad_segment, checksum)
+                    checksum = self.save_segment(f, pad_segment, checksum, mcuboot=mcuboot)
                     total_segments += 1
                 else:
                     # write the flash segment
@@ -2690,7 +2694,7 @@ class ESP32FirmwareImage(BaseFirmwareImage):
 
             # flash segments all written, so write any remaining RAM segments
             for segment in ram_segments:
-                checksum = self.save_segment(f, segment, checksum)
+                checksum = self.save_segment(f, segment, checksum, mcuboot=mcuboot)
                 total_segments += 1
 
             if self.secure_pad:
@@ -2710,7 +2714,7 @@ class ESP32FirmwareImage(BaseFirmwareImage):
                 pad_len = (self.IROM_ALIGN - align_past - checksum_space - space_after_checksum) % self.IROM_ALIGN
                 pad_segment = ImageSegment(0, b'\x00' * pad_len, f.tell())
 
-                checksum = self.save_segment(f, pad_segment, checksum)
+                checksum = self.save_segment(f, pad_segment, checksum, mcuboot=mcuboot)
                 total_segments += 1
 
             # done writing segments
@@ -2728,7 +2732,7 @@ class ESP32FirmwareImage(BaseFirmwareImage):
             except TypeError:  # Python 3
                 f.write(bytes([total_segments]))
 
-            if self.append_digest:
+            if not mcuboot and self.append_digest:
                 # calculate the SHA256 of the whole file and append it
                 f.seek(0)
                 digest = hashlib.sha256()
@@ -2738,7 +2742,7 @@ class ESP32FirmwareImage(BaseFirmwareImage):
             with open(filename, 'wb') as real_file:
                 real_file.write(f.getvalue())
 
-    def save_flash_segment(self, f, segment, checksum=None):
+    def save_flash_segment(self, f, segment, checksum=None, mcuboot=False):
         """ Save the next segment to the image file, return next checksum value if provided """
         segment_end_pos = f.tell() + len(segment.data) + self.SEG_HEADER_LEN
         segment_len_remainder = segment_end_pos % self.IROM_ALIGN
@@ -2746,7 +2750,7 @@ class ESP32FirmwareImage(BaseFirmwareImage):
             # Work around a bug in ESP-IDF 2nd stage bootloader, that it didn't map the
             # last MMU page, if an IROM/DROM segment was < 0x24 bytes over the page boundary.
             segment.data += b'\x00' * (0x24 - segment_len_remainder)
-        return self.save_segment(f, segment, checksum)
+        return self.save_segment(f, segment, checksum, mcuboot=mcuboot)
 
     def load_extended_header(self, load_file):
         def split_byte(n):
@@ -3490,6 +3494,7 @@ def make_image(args):
 
 
 def elf2image(args):
+    print('[DC]: Running elf2image with args: %s' % args)
     e = ELFFile(args.input)
     if args.chip == 'auto':  # Default to ESP8266 for backwards compatibility
         print("Creating image for ESP8266...")
@@ -3537,7 +3542,7 @@ def elf2image(args):
     image.flash_size_freq = image.ROM_LOADER.FLASH_SIZES[args.flash_size]
     image.flash_size_freq += {'40m': 0, '26m': 1, '20m': 2, '80m': 0xf}[args.flash_freq]
 
-    if args.elf_sha256_offset:
+    if not args.mcuboot and args.elf_sha256_offset:
         image.elf_sha256 = e.sha256()
         image.elf_sha256_offset = args.elf_sha256_offset
 
@@ -3551,7 +3556,7 @@ def elf2image(args):
 
     if args.output is None:
         args.output = image.default_output_name(args.input)
-    image.save(args.output)
+    image.save(args.output, mcuboot=args.mcuboot)
 
 
 def read_mac(esp, args):
@@ -3899,6 +3904,8 @@ def main(argv=None, esp=None):
                                   type=arg_auto_int, default=None)
     parser_elf2image.add_argument('--use_segments', help='If set, ELF segments will be used instead of ELF sections to genereate the image.',
                                   action='store_true')
+    parser_elf2image.add_argument('--mcuboot', help='Omit default image formatting and prepare image for loading with esp-mcuboot.',
+                                  action='store_true', default=False)
 
     add_spi_flash_subparsers(parser_elf2image, allow_keep=False, auto_detect=False)
 
